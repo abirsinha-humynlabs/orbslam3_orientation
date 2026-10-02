@@ -1,0 +1,5 @@
+numpy>=1.24
+# S3 input (optional)
+boto3>=1.28
+# check-video rendering (optional)
+opencv-python-headless>=4.8
