@@ -27,6 +27,7 @@ from orbslam3_orientation.geometry import rot_z, yaw_between  # noqa: E402
 
 ZUP = np.array([[1.0, 0, 0], [0, 0, 1.0], [0, -1.0, 0]])
 from orbslam3_orientation.reorient import reorient          # noqa: E402
+from orbslam3_orientation.simulate import level_like_exporter  # noqa: E402
 
 
 def load(d, ref=False):
@@ -68,6 +69,7 @@ def cut(dirs, gaps, rng):
             p2[m == 1] = (Rz @ (seg.p[m == 1] - seg.p[first]).T).T
             R2[m == 1] = np.einsum("ij,njk->nik", Rz, seg.R_w_cam0[m == 1])
             s2.t, s2.p, s2.R_w_cam0, s2.map_id, s2.order = seg.t[keep], p2[keep], R2[keep], m[keep], None
+            level_like_exporter(s2)                     # each part levelled as the exporter would
             r = reorient(s2)
             idx = np.searchsorted(base["timestamp_s"], r["timestamp_s"])
             # D = cut world <- uncut world, per map. A correct shared heading gives the same D for
@@ -76,6 +78,9 @@ def cut(dirs, gaps, rng):
                  for k in (0, 1)]
             rel = next(m["heading_shared_reliably"] for m in r["maps"] if m["map_id"] != r["anchor_map"])
             out[g].append((ang(D[1], D[0]), rel, r["anchor_map"]))
+            if ang(D[1], D[0]) > 5 and rel:
+                b = r["bridges"][0]
+                print(f"  outlier: {os.path.basename(d)} gap {g} s: {ang(D[1], D[0]):.1f} deg, bridge {b}")
     print(f"cut test: {used} healthy single-map runs, one cut per gap length")
     for g, e in out.items():
         if e:

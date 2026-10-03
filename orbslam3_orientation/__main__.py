@@ -104,7 +104,7 @@ def _reorient(a, ap, seg, cfg, wd):
     summary = dict(segment=res["name"], n_maps=len(res["maps"]), heading_anchor_map=res["anchor_map"],
                    healthy_maps=res["healthy_maps"], flagged_maps=res["unhealthy_maps"],
                    bridges=[(b["from_map"], b["to_map"], b["bridge_s"], b["quality"]) for b in res["bridges"]],
-                   gravity_check_deg={m["map_id"]: m["gravity_check_deg"] for m in res["maps"]},
+                   gravity_window_p90_deg={m["map_id"]: m["gravity_window_p90_deg"] for m in res["maps"]},
                    alarms=res["alarms"], files=sorted(paths))
     if a.render:
         from .render import render_maps

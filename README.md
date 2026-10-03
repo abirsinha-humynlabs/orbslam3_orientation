@@ -45,12 +45,19 @@ exactly as delivered. Only the axes change, and **every map gets the same axes**
 
 ### How a common heading is given to every map
 
-1. Per map: `R_world_imu = R_npz · T_cam0_imu[:3,:3]`, frame guard (gravity within 0.5° of
-   vertical with that extrinsic), re-levelled to the measured gravity, health checks (speed,
-   gyro correlation, length). **Maps that fail are kept and flagged, not removed.**
+1. Per map:
+   - `R_world_imu = R_npz · T_cam0_imu[:3,:3]`.
+   - **Exact export-convention guard.** With the extrinsic the exporter used, the levelling
+     residual is exactly 0; that identifies raw vs rectified, and anything else is flagged.
+   - Re-level to the measured gravity.
+   - **Health:**
+     - speed, at least 3 s long;
+     - 3-axis rate residual ≤ 0.25 of the gyro rate and correlation ≥ 0.95 (trajectory vs bias-corrected gyro);
+     - windowed gravity residual (10 s) p90 ≤ 2°.
+   - **Maps that fail are kept and flagged, not removed.** See `docs/how_it_works.md` §2 and §11.
 2. **Heading anchor:** the first healthy map. Its first second defines world +Z.
 3. **Hand-off across each map break, by the gyroscope:** integrate the bias-corrected gyro from
-   0.5 s inside the previous reliable map (poses right at a tracking loss are often off) to the
+   0.5 s inside the previous reliable *healthy* map (poses right at a tracking loss are often off) to the
    first 1.5 s of the next map. The heading difference (circular mean) is applied to the whole
    next map. Maps before the anchor are bridged backwards in time.
    - **Gyro bias:** median of (gyro − trajectory body rate) over 2 s windows of every map whose
@@ -68,9 +75,9 @@ exactly as delivered. Only the axes change, and **every map gets the same axes**
 | --- | --- |
 | `trajectory.npz` | same keys (`segment, timestamp_s, position_m, rotation, segment_files, frame_note`), dtypes, row count and order; `rotation` and `position_m` re-oriented, `frame_note` updated |
 | `segments/segNN_mapK_poses.txt` | same names, `timestamp_s x y z r00..r22` (row-major), `%.9f`, header updated |
-| `segments_manifest.json` | copied; extents recomputed in the new axes; `pose_frame` → `cam0_rectified`; a `post_process` block added |
-| `report.json` | copied unchanged |
-| `orientation_report.json` | **new sidecar.** Conventions; per map: `healthy` + `health_issues`, `orientation_trusted`, `heading_anchor`, `heading_shared_reliably`, `yaw_applied_deg`, gravity check; per hand-off: gap, bridge length, rotation during the bridge, yaw, spread, tilt residual, `quality` (`good` / `fair` / `approximate` / `poor`); segment gyro bias; alarms |
+| `segments_manifest.json` | copied; extents recomputed in the new axes; explicit markers `rotation_frame`/`position_frame` = `cam0_rectified`, `axis_convention` = `opeth_a2` (never re-rotate); a `post_process` block added |
+| `report.json`, `status.json`, … | every other file of ORB-SLAM3's folder copied unchanged |
+| `orientation_report.json` | **new sidecar.** Conventions; per map: `healthy` + `health_issues`, `export_convention`, rate and windowed-gravity metrics, `orientation_trusted`, `heading_anchor`, `heading_source`, `heading_shared_reliably`, `yaw_applied_deg`; per hand-off: gap, bridge length, rotation during the bridge, yaw, spread, tilt residual, `quality` (`good` / `fair` / `approximate` / `poor`); segment gyro bias; alarms |
 
 ORB-SLAM3's own folder is never modified (the writer refuses `--out` equal to the source).
 
@@ -79,22 +86,24 @@ ORB-SLAM3's own folder is never modified (the writer refuses `--out` equal to th
 **Synthetic** (`tests/test_reorient.py`): three maps with random headings. One rotation fits all
 maps to within **0.26°**; +Y is gravity; structure is identical; the source folder is untouched.
 
-**Real data, cut test** (`tools/validate_reorient.py cut`): 71 healthy single-map runs, each cut
+**Real data, cut test** (`tools/validate_reorient.py cut`): 70 healthy single-map runs, each cut
 into two maps with a random heading and origin. The error is the heading-transfer error between
 the two maps.
 
 | Gap | Hand-offs graded reliable: median / p95 / worst | All hand-offs: median / p95 |
 | --- | --- | --- |
-| 0.13 s | 0.34° / 0.64° / 0.73° | 0.37° / 1.09° |
-| 1 s | 0.33° / 0.77° / 1.26° | 0.37° / 1.14° |
-| 5 s | 0.44° / 1.56° / 2.53° | 0.51° / 1.91° |
-| 30 s | (always graded `poor`) | 0.94° / 7.3° |
+| 0.13 s | 0.37° / 0.86° / 1.23° | 0.37° / 0.96° |
+| 1 s | 0.37° / 1.08° / 1.53° | 0.38° / 1.07° |
+| 5 s | 0.44° / 1.70° / 2.53° | 0.48° / 1.95° |
+| 30 s | (always graded `poor`) | 0.88° / 5.2° |
 
 **Real map breaks vs mod-slam** (`tools/validate_reorient.py real`): mod-slam is one continuous
 map, independent of ORB-SLAM3. The heading offset to mod-slam is compared 2 s before vs 2 s after
-each hand-off, on 10 multi-map runs:
-- hand-offs graded reliable: median **3.0°**, p90 7.9° (n=8);
-- flagged: median 15.5°, max 74° (n=9).
+each hand-off between two orientation-trusted maps:
+- before the review fixes, on 10 runs: graded reliable, median **3.0°**, p90 7.9° (n=8); flagged,
+  median 15.5°, max 74° (n=9);
+- after them, only 3 hand-offs remain between two trusted maps: 0.25° (PLN-024, 3.8 s gap),
+  7.7° (27.6 s gap) and 8.3° (84 s gap, flagged).
 
 Real breaks happen during violent head motion: 150–2000° of rotation inside the gap. So
 long-gap heading is uncertain at the several-degree level, and the grade says so. Measured
@@ -107,14 +116,14 @@ directly, gyro vs mod-slam across real breaks: under 1 s gaps ~0.15°; 1–10 s 
   gives image-up = up. Looking at the lap while seated, the camera points past vertical and
   image-down legitimately has an upward component.
 
-**Batch results** (all 39 cached multi-map runs, 113 maps):
+**Batch results** (all 39 cached multi-map runs, 113 maps, after the review fixes of 2026-10-03):
 - All 39 outputs have the same structure as ORB-SLAM3's: keys, shapes and timestamps.
-- 17 maps are healthy; 48 maps (including the heading anchors) have their heading reliably shared.
-- Hand-off grades: 5 good, 8 fair, 8 approximate, 53 poor. Almost all poor hand-offs go into maps
-  ORB-SLAM3 itself lost.
-- 7 runs raise the alarm "no map has a trustworthy orientation".
-- The per-map gravity check is 0.00°. That is a self-consistency check only: each map is levelled
-  with the same accelerometer data.
+- Export convention identified exactly as `raw_cam0` on all 113 maps.
+- 16 maps are healthy; 26 maps (including the heading anchors) have their heading reliably shared.
+  Before the stricter orientation tests and the healthy-only rule for heading sources, this was 48.
+- Hand-off grades: 3 good, 7 fair, 9 approximate, 55 poor.
+- 24 runs raise an alarm, mostly "no healthy map". The windowed gravity residual (p90 per map)
+  has median 2.6° and max 33°; most maps are ORB-SLAM3 tracking failures.
 
 ### Usage
 

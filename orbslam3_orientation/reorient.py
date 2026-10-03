@@ -26,7 +26,7 @@ import numpy as np
 from .core import Config, _check_map, _gyro_mean_rate, _rates
 from .geometry import integrate_gyro, interp3, rot_z, yaw_between
 
-FRAME_NOTE = ("Opeth A.2 axes: +X right, +Y down (gravity), +Z forward (operator facing at the start "
+FRAME_NOTE = ("OPETH_A2 cam0_rectified (already A.2: do not re-rotate). Opeth A.2 axes: +X right, +Y down (gravity), +Z forward (operator facing at the start "
               "of the heading-anchor map = the first healthy map; the same world heading in every map, "
               "carried across map breaks by the gyroscope). rotation = world <- rectified "
               "left camera (+X image right, +Y image down, +Z optical axis). position_m = that camera's "
@@ -35,10 +35,67 @@ POSE_HEADER = ("timestamp_s x y z r00..r22  (Opeth A.2: +X right, +Y down, +Z fo
                "rectified left camera; THIS SEGMENT'S OWN ORIGIN, heading shared with the other segments)")
 
 
-def _orientation_ok(info, cfg):
-    """Can this map's ORIENTATION be trusted (for anchoring headings)? Position may still be bad."""
-    return (info.tilt_raw_deg is not None and info.tilt_raw_deg <= cfg.frame_tilt_max_deg
-            and info.gyro_corr is not None and info.gyro_corr >= cfg.gyro_corr_min)
+def _rate_pairs(seg, t, R):
+    """Trajectory body rates and mean gyro over the same consecutive-pose intervals."""
+    w, dt = _rates(t, R)
+    o = seg.imu_offset_s
+    ok = (dt < 0.1) & (t[:-1] + o > seg.t_imu[0]) & (t[1:] + o < seg.t_imu[-1])
+    if ok.sum() < 30:
+        return None, None
+    return w[ok], _gyro_mean_rate(seg.t_imu, seg.gyr, t[:-1][ok] + o, t[1:][ok] + o)
+
+
+def _orientation_metrics(seg, M, bias, cfg):
+    """Does this map's ORIENTATION follow the IMU? Two independent tests:
+    - 3-axis rates: trajectory body rate vs (gyro - bias), RMS residual relative to the gyro's RMS
+      rate, and correlation of all three components (a magnitude correlation ignores axis errors and straddles its threshold
+      on diverged maps);
+    - windowed gravity: mean specific force over each cfg.grav_window_s window, angle to the
+      map's vertical, p90 over windows. (A whole-map mean is forced to 0 by the levelling.)"""
+    out = dict(rate_rms_dps=None, rate_rel=None, rate_corr3=None, gravity_window_p90_deg=None, gravity_window_max_deg=None)
+    w, g = _rate_pairs(seg, M["t"], M["R"])
+    if w is not None:
+        e = np.degrees(np.linalg.norm(g - bias - w, axis=1))
+        out["rate_rms_dps"] = float(np.sqrt(np.mean(e ** 2)))
+        out["rate_rel"] = out["rate_rms_dps"] / max(float(np.degrees(np.sqrt(np.mean(np.sum((g - bias) ** 2, 1))))), 1e-9)
+        out["rate_corr3"] = float(np.corrcoef((g - bias).ravel(), w.ravel())[0, 1])
+    t, R = M["t"], M["R"]
+    ti = np.clip(t + seg.imu_offset_s, seg.t_imu[0], seg.t_imu[-1])
+    fw = np.einsum("nij,nj->ni", R, interp3(ti, seg.t_imu, seg.acc))
+    res = []
+    for a in np.arange(t[0], t[-1] - cfg.grav_window_s / 2, cfg.grav_window_s):
+        m = (t >= a) & (t < a + cfg.grav_window_s)
+        if m.sum() > 50:
+            v = fw[m].mean(0)
+            res.append(float(np.degrees(np.arccos(np.clip(v[2] / np.linalg.norm(v), -1, 1)))))
+    if len(res) >= 2:                      # one window = the whole-map mean, which is 0 by construction
+        out["gravity_window_p90_deg"], out["gravity_window_max_deg"] = float(np.percentile(res, 90)), max(res)
+    why = []
+    if M["info"].export_convention != "raw_cam0" and M["info"].export_convention != "rectified_cam0":
+        why.append("export convention not recognised")
+    if out["rate_rms_dps"] is None:
+        why.append("too few poses for the rate test")
+    else:
+        if out["rate_rel"] > cfg.rate_rel_max:
+            why.append(f"3-axis rate residual {out['rate_rel']:.2f} of the gyro rate ({out['rate_rms_dps']:.1f} deg/s)")
+        if out["rate_corr3"] < cfg.rate_corr3_min:
+            why.append(f"3-axis rate correlation {out['rate_corr3']:.3f}")
+    if out["gravity_window_p90_deg"] is not None and out["gravity_window_p90_deg"] > cfg.grav_p90_max_deg:
+        why.append(f"windowed gravity residual p90 {out['gravity_window_p90_deg']:.2f} deg")
+    return out, why
+
+
+def _pooled_bias(seg, maps):
+    """Gyro bias for the rate test: median (gyro - body rate) over the maps whose POSITION is
+    healthy (independent of the orientation test it feeds), else over all maps."""
+    pos_ok = [M for M in maps if M["info"].speed_p99 is not None and not any(
+        r.startswith(("speed", "too short")) for r in M["info"].reasons)]
+    est = []
+    for M in pos_ok or maps:
+        w, g = _rate_pairs(seg, M["t"], M["R"])
+        if w is not None:
+            est.append(g - w)
+    return np.median(np.vstack(est), 0) if est else np.zeros(3)
 
 
 def _bias(seg, t, R, t_end, window):
@@ -98,8 +155,17 @@ def reorient(seg, cfg: Config | None = None) -> dict:
         R_wi = seg.R_w_cam0[sel] @ R_raw
         if data is None:                                   # too short to re-level: use ORB-SLAM3's levelling
             data = dict(t=seg.t[sel], p=seg.p[sel], R=R_wi)
-        maps.append(dict(id=k, sel=sel, info=info, t=data["t"], p=data["p"], R=data["R"],
-                         orient_ok=_orientation_ok(info, cfg)))
+        maps.append(dict(id=k, sel=sel, info=info, t=data["t"], p=data["p"], R=data["R"]))
+
+    # ---- orientation tests (3-axis rates, windowed gravity); a failure also makes the map unhealthy
+    rate_bias = _pooled_bias(seg, maps)
+    for M in maps:
+        M["metrics"], why = _orientation_metrics(seg, M, rate_bias, cfg)
+        M["orient_ok"] = not why
+        for r in why:
+            if r not in M["info"].reasons:
+                M["info"].reasons.append(r)
+        M["info"].kept = M["info"].kept and not why
 
     # ---- headings: chain through maps in TIME order
     order = sorted(range(len(maps)), key=lambda i: maps[i]["t"][0])
@@ -109,6 +175,14 @@ def reorient(seg, cfg: Config | None = None) -> dict:
                   next((i for i in order if maps[i]["orient_ok"]), order[0]))
     if not maps[anchor]["orient_ok"]:
         alarms.append("no map has a trustworthy orientation; headings are ORB-SLAM3's own")
+    any_healthy = any(M["info"].kept for M in maps)
+    if maps[anchor]["orient_ok"] and not any_healthy:
+        alarms.append("no healthy map: the heading anchor and sources are maps whose position diverged")
+    if any(M["info"].export_convention == "rectified_cam0" for M in maps):
+        alarms.append("ORB-SLAM3 export convention changed upstream: rotation is world <- RECTIFIED cam0 "
+                      "(identified exactly and handled)")
+    if any(M["info"].export_convention == "unrecognised" for M in maps):
+        alarms.append("ORB-SLAM3 export convention not recognised on some map(s): their orientation is not trusted")
     yaw = {anchor: 0.0}
     bridges = []
     seg_bias, n_bias = _segment_bias(seg, maps)
@@ -184,9 +258,11 @@ def reorient(seg, cfg: Config | None = None) -> dict:
         yaw[dst] = psi
         bridges.append(rec)
         ok = maps[dst]["orient_ok"] and rec["quality"] != "poor"
-        if ok:
-            reliable.append(dst)
         heading_ok[dst] = ok
+        # only HEALTHY maps seed later hand-offs (a map whose position diverged is not a heading
+        # source, however well its rates match), unless the segment has no healthy map at all
+        if ok and (maps[dst]["info"].kept or not any_healthy):
+            reliable.append(dst)
 
     reliable, heading_ok = [anchor], {anchor: maps[anchor]["orient_ok"]}
     for i in order[order.index(anchor) + 1:]:               # forward in time from the anchor
@@ -219,24 +295,14 @@ def reorient(seg, cfg: Config | None = None) -> dict:
         # rows of this map in the ORIGINAL file order (M["t"] is the same order as seg.t[sel])
         rotation[M["sel"]] = R_o
         position[M["sel"]] = p_o
-        # gravity self-check for this map: mean specific force must be -Y
-        ti = M["t"] + seg.imu_offset_s
-        ins = (ti >= seg.t_imu[0]) & (ti <= seg.t_imu[-1])
-        g_err = None
-        if ins.sum() > 10:
-            R_oi = np.einsum("nij,jk->nik", R_o, R_rect)              # world <- IMU
-            f = np.einsum("nij,nj->ni", R_oi[ins], interp3(ti[ins], seg.t_imu, seg.acc)).mean(0)
-            g_err = float(np.degrees(np.arccos(np.clip(-f[1] / np.linalg.norm(f), -1, 1))))
         d = asdict(M["info"])
         d.update(healthy=d.pop("kept"), health_issues=d.pop("reasons"), orientation_trusted=M["orient_ok"],
                  heading_anchor=(i == anchor), heading_shared_reliably=bool(heading_ok.get(i, False)),
-                 yaw_applied_deg=round(float(np.degrees(yaw.get(i, 0.0))), 2),
-                 gravity_check_deg=None if g_err is None else round(g_err, 4))
+                 heading_source=(i in reliable), yaw_applied_deg=round(float(np.degrees(yaw.get(i, 0.0))), 2),
+                 **{k: (None if v is None else round(v, 4)) for k, v in M["metrics"].items()})
         report_maps.append(d)
-        if g_err is not None and g_err > 1.0 and M["orient_ok"]:
-            alarms.append(f"map {M['id']}: gravity {g_err:.2f} deg off -Y after re-orientation")
 
-    return dict(gyro_bias_rad_s=None if seg_bias is None else [round(float(x), 5) for x in seg_bias],
+    return dict(rate_test_bias_rad_s=[round(float(x), 5) for x in rate_bias], gyro_bias_rad_s=None if seg_bias is None else [round(float(x), 5) for x in seg_bias],
                 gyro_bias_windows=n_bias, name=seg.name, rotation=rotation, position_m=position, timestamp_s=seg.t, map_id=seg.map_id,
                 healthy_maps=[m["map_id"] for m in report_maps if m["healthy"]],
                 unhealthy_maps=[m["map_id"] for m in report_maps if not m["healthy"]], maps=report_maps, bridges=bridges, alarms=alarms, anchor_map=maps[anchor]["id"],

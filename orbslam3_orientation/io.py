@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-ORB_FILES = ("trajectory.npz", "segments_manifest.json", "report.json")
+ORB_FILES = ("trajectory.npz", "segments_manifest.json", "report.json", "status.json", "timeshift.json")
 INPUT_FILES = ("imu.csv", "calibration.json", "frame_timestamps.csv")
 MOD_FILES = ("vio/trajectory.txt",)
 

@@ -5,7 +5,8 @@
   segments/segNN_mapK_poses.txt  one per map, same names, `t x y z r00..r22`, fmt %.9f
   segments_manifest.json         copied; per-map extents recomputed in the new axes,
                                  "pose_frame" and a "post_process" block describe the change
-  report.json                    copied unchanged
+  report.json, status.json, ...  every other file of ORB-SLAM3's folder copied unchanged, so a
+                                 reader of the orbslam3 folder finds everything it expects
   orientation_report.json        NEW sidecar: conventions, per-map health (healthy maps and the
                                  flagged ones), heading bridges, gravity check, alarms
 
@@ -65,14 +66,28 @@ def write(res: dict, seg, out_dir: str) -> dict:
             e = extents.get(os.path.basename(s.get("file", "")))
             if e is not None:
                 s.update(extent_x_m=float(e[0]), extent_y_m=float(e[1]), extent_z_m=float(e[2]))
-        m["pose_frame"] = "cam0_rectified"
-        m["post_process"] = dict(tool="orbslam3_orientation", version=__version__, original_pose_frame_label=json.load(open(man)).get("pose_frame"),
+        orig = json.load(open(man)).get("pose_frame")
+        # explicit markers: a reader must dispatch on these and never re-rotate this output
+        m.update(pose_frame="cam0_rectified", rotation_frame="cam0_rectified", position_frame="cam0_rectified",
+                 world_frame="opeth_a2", axis_convention="opeth_a2", gravity_axis="+y_down")
+        m["post_process"] = dict(tool="orbslam3_orientation", version=__version__, original_pose_frame_label=orig,
                                  axis_convention=res["conventions"]["axis_convention"], frame_note=res["frame_note"],
+                                 already_in_a2="do NOT apply an OKVIS/Basalt -> A.2 rotation to this output",
                                  report="orientation_report.json")
         paths["segments_manifest.json"] = os.path.join(out_dir, "segments_manifest.json")
         json.dump(m, open(paths["segments_manifest.json"], "w"), indent=2)
-    if os.path.exists(os.path.join(src, "report.json")):
-        paths["report.json"] = shutil.copy(os.path.join(src, "report.json"), os.path.join(out_dir, "report.json"))
+    # every other file ORB-SLAM3 published (status.json, report.json, timeshift.json, ...)
+    written = {"trajectory.npz", "segments_manifest.json", "orientation_report.json"}
+    for root, _, fs in os.walk(src):
+        rel = os.path.relpath(root, src)
+        if rel.split(os.sep)[0] == "segments" and rel != ".":
+            continue                                       # per-map pose files are rewritten above
+        for f in fs:
+            r = os.path.normpath(os.path.join(rel, f))
+            if r in written or r.startswith("segments" + os.sep):
+                continue
+            os.makedirs(os.path.join(out_dir, rel), exist_ok=True)
+            paths[r] = shutil.copy2(os.path.join(root, f), os.path.join(out_dir, r))
 
     rep = {k: v for k, v in res.items() if k not in ("rotation", "position_m", "timestamp_s", "map_id")}
     rep.update(tool="orbslam3_orientation", version=__version__, n_poses=int(n), source=os.path.abspath(src),

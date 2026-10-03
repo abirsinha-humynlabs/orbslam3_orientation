@@ -31,7 +31,16 @@ G = 9.80665
 @dataclass
 class Config:
     min_map_s: float = 3.0            # maps shorter than this are dropped
-    frame_tilt_max_deg: float = 0.5   # gravity must read this close to vertical with T_cam0_imu
+    frame_tilt_max_deg: float = 0.5   # process(): gravity must read this close to vertical with T_cam0_imu
+    frame_exact_max_deg: float = 1e-4 # export convention: the exporter levels with the same data, so the
+                                      # matching extrinsic gives a residual of exactly 0 (< 1e-6 on 133 maps;
+                                      # the other extrinsic >= 0.0045 deg)
+    rate_rel_max: float = 0.25        # reorient: 3-axis rate residual RMS / gyro rate RMS (scale-free; an
+                                      # absolute deg/s limit flags fast but good motion). Position-healthy
+                                      # maps median 0.06, p97 ~0.25; diverged median 0.36
+    rate_corr3_min: float = 0.95      # reorient: correlation of the 3-axis rates (healthy p5 0.98)
+    grav_window_s: float = 10.0       # reorient: windowed gravity residual, window length
+    grav_p90_max_deg: float = 2.0     # reorient: p90 over windows (healthy p99 1.7; diverged median 2.1)
     speed_p99_max: float = 3.0        # m/s at 10 Hz (walking head)
     speed_max_max: float = 15.0       # m/s at 10 Hz (allows brief fast motion / riding)
     gyro_corr_min: float = 0.90       # rotation-rate magnitude vs gyroscope
@@ -117,6 +126,7 @@ class MapInfo:
     reasons: list = field(default_factory=list)
     tilt_raw_deg: float | None = None      # gravity tilt with T_cam0_imu, before re-levelling
     tilt_rect_deg: float | None = None     # same with the rectified extrinsic (diagnostic)
+    export_convention: str | None = None   # raw_cam0 | rectified_cam0 | unrecognised
     speed_p99: float | None = None
     speed_max: float | None = None
     gyro_corr: float | None = None
@@ -144,15 +154,27 @@ def _check_map(seg, sel, R_raw, R_rect, cfg):
         info.kept = False
         info.reasons.append(f"too short ({t[-1] - t[0]:.1f} s)")
         return info, None
+    # Export-convention guard. The exporter (make_deliverables_multi.load_segment) levels each map
+    # with mean(R_wb @ acc) using np.interp at these same times, so with the extrinsic it really
+    # used the residual is exactly 0. Exactness tells raw from rectified even when R1 barely tilts
+    # gravity (a 0.5 deg tolerance cannot: 49 of 132 maps have tilt_rect < 0.5 deg).
+    f_all = np.stack([np.interp(ti, seg.t_imu, seg.acc[:, k]) for k in range(3)], 1)
+    up_raw = np.einsum("nij,jk,nk->ni", Rc, R_raw, f_all).mean(0)
+    up_rect = np.einsum("nij,jk,nk->ni", Rc, R_rect, f_all).mean(0)
+    info.tilt_raw_deg, info.tilt_rect_deg = _tilt_deg(up_raw), _tilt_deg(up_rect)
+    if info.tilt_raw_deg <= cfg.frame_exact_max_deg:
+        info.export_convention = "raw_cam0"
+    elif info.tilt_rect_deg <= cfg.frame_exact_max_deg:
+        info.export_convention = "rectified_cam0"
+        R_wi = Rc @ R_rect                       # identified exactly, so use it (and report it)
+    else:
+        info.export_convention = "unrecognised"
+        info.reasons.append(f"export convention not recognised: gravity residual {info.tilt_raw_deg:.4f} deg "
+                            f"with T_cam0_imu, {info.tilt_rect_deg:.4f} deg with T_cam0rect_imu (exactly 0 expected)")
     f = interp3(ti[inside], seg.t_imu, seg.acc)
     up = np.einsum("nij,nj->ni", R_wi[inside], f).mean(0)
-    info.tilt_raw_deg = _tilt_deg(up)
-    info.tilt_rect_deg = _tilt_deg(np.einsum("nij,jk,nk->ni", Rc[inside], R_rect, f).mean(0))
-    if info.tilt_raw_deg > cfg.frame_tilt_max_deg:
-        info.kept = False
-        info.reasons.append(f"frame check: gravity {info.tilt_raw_deg:.2f} deg off with T_cam0_imu"
-                            + (" (rectified extrinsic fits: rotation convention changed upstream)"
-                               if info.tilt_rect_deg < cfg.frame_tilt_max_deg else ""))
+    if info.tilt_raw_deg > cfg.frame_tilt_max_deg and info.export_convention == "unrecognised":
+        info.reasons.append(f"frame check: gravity {info.tilt_raw_deg:.2f} deg off with T_cam0_imu")
     # health
     sp = _speeds_10hz(t, p)
     if len(sp):

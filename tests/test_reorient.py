@@ -101,5 +101,52 @@ def test_reorient_deliverable():
         return float(np.max(err))
 
 
+def test_guards():
+    """Reviewer findings E5-E8: each guard must fire on the failure it exists for."""
+    from orbslam3_orientation.geometry import exp_so3
+    from orbslam3_orientation.simulate import level_like_exporter
+    cfg = Config(speed_p99_max=5.0)
+    # E6: exporter switched to the RECTIFIED extrinsic -> identified exactly, not missed
+    seg, _ = make_segment()
+    R_rect = np.array(seg.calib["rectified_extrinsics"]["T_cam0rect_imu"])[:3, :3]
+    R_raw = np.array(seg.calib["imu"]["T_cam0_imu"])[:3, :3]
+    seg.R_w_cam0 = np.einsum("nij,jk,lk->nil", seg.R_w_cam0, R_raw, R_rect)    # world <- rect cam0
+    level_like_exporter(seg, R_rect)
+    r = reorient(seg, cfg)
+    assert all(m["export_convention"] == "rectified_cam0" for m in r["maps"])
+    assert any("convention changed upstream" in a for a in r["alarms"])
+    # E6: an unknown convention (rotation off by 0.3 deg) -> not trusted, alarm
+    seg, _ = make_segment()
+    seg.R_w_cam0 = np.einsum("nij,jk->nik", seg.R_w_cam0, exp_so3([0.005, 0, 0]))
+    r = reorient(seg, cfg)
+    assert all(m["export_convention"] == "unrecognised" and not m["orientation_trusted"] for m in r["maps"])
+    assert any("not recognised" in a for a in r["alarms"])
+    # E5: a map whose tilt drifts (2 deg over its length) -> windowed gravity flags it,
+    # although its whole-map mean is levelled to 0
+    seg, _ = make_segment()
+    s = seg.map_id == 0
+    ang = np.radians(4.0) * (seg.t[s] - seg.t[s][0]) / (seg.t[s][-1] - seg.t[s][0]) - np.radians(2.0)
+    seg.R_w_cam0[s] = np.stack([exp_so3([a, 0, 0]) @ R for a, R in zip(ang, seg.R_w_cam0[s])])
+    level_like_exporter(seg)
+    r = reorient(seg, Config(speed_p99_max=5.0, grav_p90_max_deg=1.0))
+    m0 = [m for m in r["maps"] if m["map_id"] == 0][0]
+    assert m0["gravity_window_p90_deg"] > 1.0 and not m0["orientation_trusted"], m0
+    # E8: every other ORB-SLAM3 file is carried over, and the output is marked as already A.2
+    seg0, _ = make_segment()
+    with tempfile.TemporaryDirectory() as tmp:
+        orb = os.path.join(tmp, "orbslam3")
+        inp = _fake_orbslam3(seg0, orb)
+        json.dump({"status": "ok"}, open(os.path.join(orb, "status.json"), "w"))
+        seg = load_local(orb, inp)
+        out = os.path.join(tmp, "out")
+        write(reorient(seg, cfg), seg, out)
+        assert json.load(open(os.path.join(out, "status.json"))) == {"status": "ok"}
+        man = json.load(open(os.path.join(out, "segments_manifest.json")))
+        assert man["axis_convention"] == "opeth_a2" and man["rotation_frame"] == "cam0_rectified"
+        assert str(np.load(os.path.join(out, "trajectory.npz"))["frame_note"]).startswith("OPETH_A2")
+
+
 if __name__ == "__main__":
     print(f"ok: max orientation error across all maps {test_reorient_deliverable():.3f} deg")
+    test_guards()
+    print("ok: guards (rectified convention, unknown convention, tilt drift, file carry-over, markers)")

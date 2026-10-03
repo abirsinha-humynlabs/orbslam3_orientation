@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from orbslam3_orientation.core import Config, process            # noqa: E402
 from orbslam3_orientation.geometry import exp_so3, rot_z          # noqa: E402
 from orbslam3_orientation.io import Segment                       # noqa: E402
+from orbslam3_orientation.simulate import level_like_exporter      # noqa: E402
 
 G = 9.80665
 
@@ -71,6 +72,7 @@ def make_segment(cuts=((20.0, 0.13), (40.0, 1.5)), seed=0):
         p_store[s] = (Rz @ (pt[s] - pt[first]).T).T
     seg = Segment(name="synthetic", t=tf[keep], p=p_store[keep], R_w_cam0=R_store[keep], map_id=mid[keep],
                   t_imu=t_imu, acc=acc, gyr=gyr, calib=calib, imu_offset_s=off, offset_source="test")
+    level_like_exporter(seg)                                # what the ORB-SLAM3 exporter does per map
     truth = dict(t=tf[keep], R_wi=Rt[keep], p_wi=pt[keep], R_rect=R1 @ R_raw, c_imu=-(R1 @ R_raw).T @ (R1 @ T_raw[:3, 3]))
     return seg, truth
 
