@@ -8,7 +8,7 @@ Two modes:
 
 | Mode | What it writes | Use |
 | --- | --- | --- |
-| **`reorient`** (the delivered one) | the **same files, names, keys, rows and map structure** as ORB-SLAM3 (`trajectory.npz`, `segments/segNN_mapK_poses.txt`, …), only re-oriented | downstream reads it instead of ORB-SLAM3's own output |
+| **`reorient`** (the delivered one) | the **same files, names, keys, rows and map structure** as ORB-SLAM3 (`trajectory.npz`, `segments/segNN_mapK_poses.txt`, …), only re-oriented, plus an A.2 sidecar | downstream reads it instead of ORB-SLAM3's own output, **with no code change**: the MCAP exporter's existing rotation turns it into Opeth A.2 |
 | `process` | one stitched, continuous trajectory (`poses.csv/npz`) | experimental, not used downstream |
 
 ## Why it's needed
@@ -35,20 +35,31 @@ ORB-SLAM3 often splits a video into several atlas maps (a 10-minute video may ha
 separate; **no stitching, no pose added or removed, positions restart at (0,0,0) in every map**,
 exactly as delivered. Only the axes change, and **every map gets the same axes**:
 
-| | ORB-SLAM3 as delivered | After `reorient` |
-| --- | --- | --- |
-| world axes | +z up; x/y heading arbitrary and **different in every map** | **+X right, +Y down (gravity), +Z forward**, the **same heading in every map** |
-| world +Z | – | the operator's horizontal facing over the first second of the heading-anchor map (the first healthy map; usually map 0) |
-| `rotation` | world ← raw left camera (labelled "imu") | world ← **rectified left camera** (the camera of `left_rectified.mp4`: +X image right, +Y image down, +Z optical axis) |
-| `position_m` | IMU origin, per-map origin | rectified left camera centre, per-map origin (0,0,0 at the map's first pose) |
-| `timestamp_s`, `segment`, `segment_files` | – | unchanged, bit for bit |
+| | ORB-SLAM3 as delivered | `trajectory.npz` after `reorient` (default) | `trajectory_a2_camera.npz` (sidecar) |
+| --- | --- | --- | --- |
+| world axes | +z up; x/y heading arbitrary and **different in every map** | +z up, **+x right, +y forward**, the **same heading in every map** | **Opeth A.2: +X right, +Y down, +Z forward**, same heading in every map |
+| `rotation` | world ← raw left camera (labelled "imu") | world ← **IMU** (the label is now true) | world ← **rectified left camera** (+X image right, +Y image down, +Z optical axis) |
+| `position_m` | IMU origin, per-map origin | IMU origin, per-map origin | camera centre, per-map origin |
+| `timestamp_s`, `segment`, `segment_files` | – | unchanged, bit for bit | unchanged |
+
+"Forward" is the operator's horizontal facing over the first second of the heading-anchor map
+(the first healthy map; usually map 0).
+
+**Why this default:** the MCAP exporter (`bitrobot_to_mcap.load_orbslam3`) assumes the file
+holds the IMU pose in a Z-up world, and applies R_x(−90°) to reach A.2. With this output, that
+existing code publishes the correct A.2 pose: verified by running the unmodified loader
+(`tools/check_with_mcap_loader.py`). Downstream only has to read this folder instead of
+ORB-SLAM3's, via `--vio <path>` or `--orbslam-bucket <bucket>` with the same key layout.
+`--convention a2-camera` makes the A.2 camera version the main file instead.
 
 ### How a common heading is given to every map
 
 1. Per map:
    - `R_world_imu = R_npz · T_cam0_imu[:3,:3]`.
-   - **Exact export-convention guard.** With the extrinsic the exporter used, the levelling
-     residual is exactly 0; that identifies raw vs rectified, and anything else is flagged.
+   - **Export-convention guard, once per segment.** With the extrinsic the exporter used, the
+     levelling residual is exactly 0, which identifies raw vs rectified. If neither is exact, a
+     clear margin (≤ 0.05° and 3× better) gives an `*_approx` result with an alarm; anything else
+     is `unrecognised`.
    - Re-level to the measured gravity.
    - **Health:**
      - speed, at least 3 s long;
@@ -73,11 +84,12 @@ exactly as delivered. Only the axes change, and **every map gets the same axes**
 
 | File | Content |
 | --- | --- |
-| `trajectory.npz` | same keys (`segment, timestamp_s, position_m, rotation, segment_files, frame_note`), dtypes, row count and order; `rotation` and `position_m` re-oriented, `frame_note` updated |
-| `segments/segNN_mapK_poses.txt` | same names, `timestamp_s x y z r00..r22` (row-major), `%.9f`, header updated |
-| `segments_manifest.json` | copied; extents recomputed in the new axes; explicit markers `rotation_frame`/`position_frame` = `cam0_rectified`, `axis_convention` = `opeth_a2` (never re-rotate); a `post_process` block added |
+| `trajectory.npz` | same keys (`segment, timestamp_s, position_m, rotation, segment_files, frame_note`), dtypes, row count and order; IMU pose in the shared Z-up world (default); `frame_note` starts with `ORB_ORIENTATION imu_zup` |
+| `segments/segNN_mapK_poses.txt` | same names, `timestamp_s x y z r00..r22` (row-major), `%.9f`, same convention as `trajectory.npz`, header updated |
+| `trajectory_a2_camera.npz` | sidecar: same rows, Opeth A.2 world ← rectified left camera |
+| `segments_manifest.json` | copied; extents recomputed; markers `pose_frame`/`rotation_frame`/`position_frame` = `imu`, `axis_convention` = `zup_then_rx_minus90_to_opeth_a2`; a `post_process` block added |
 | `report.json`, `status.json`, … | every other file of ORB-SLAM3's folder copied unchanged |
-| `orientation_report.json` | **new sidecar.** Conventions; per map: `healthy` + `health_issues`, `export_convention`, rate and windowed-gravity metrics, `orientation_trusted`, `heading_anchor`, `heading_source`, `heading_shared_reliably`, `yaw_applied_deg`; per hand-off: gap, bridge length, rotation during the bridge, yaw, spread, tilt residual, `quality` (`good` / `fair` / `approximate` / `poor`); segment gyro bias; alarms |
+| `orientation_report.json` | **new.** Conventions; per map: `healthy` + `health_issues`, `export_convention`, rate and windowed-gravity metrics, `orientation_trusted`, `heading_anchor`, `heading_source`, `heading_shared_reliably`, `yaw_applied_deg`; per hand-off: gap, bridge length, rotation during the bridge, yaw, spread, tilt residual, `quality` (`good` / `fair` / `approximate` / `poor`); segment gyro bias; alarms |
 
 ORB-SLAM3's own folder is never modified (the writer refuses `--out` equal to the source).
 
@@ -116,6 +128,13 @@ directly, gyro vs mod-slam across real breaks: under 1 s gaps ~0.15°; 1–10 s 
   gives image-up = up. Looking at the lap while seated, the camera points past vertical and
   image-down legitimately has an upward component.
 
+**Unmodified MCAP loader** (`tools/check_with_mcap_loader.py`, v1.3.0 default output of the six
+rendered clips, run through the monorepo's `bitrobot_to_mcap.load_orbslam3` as is): all six PASS.
+- The published `ego_vio_world ← ego_imu` pose, with the camera calibration applied, equals the A.2
+  camera sidecar to 0.002° (quaternion precision).
+- Gravity points to −Y: windowed p90 0.3–1.1° on healthy maps.
+- The operator's starting facing is +Z (X component ≤ 0.02).
+
 **Batch results** (all 39 cached multi-map runs, 113 maps, after the review fixes of 2026-10-03):
 - All 39 outputs have the same structure as ORB-SLAM3's: keys, shapes and timestamps.
 - Export convention identified exactly as `raw_cam0` on all 113 maps.
@@ -140,6 +159,7 @@ python -m src reorient --bucket prod-egc-stereo-v2-data --profile prod \
     --segment <dataset>/.../<chunk>/seg_NNN --out <new folder> [--render check.mp4]
 
 python tests/test_reorient.py
+python tools/check_with_mcap_loader.py --monorepo <monorepo> --out <output dir> --inputs <chunking dir>
 python tools/validate_reorient.py cut  <segdir> ...
 python tools/validate_reorient.py real <segdir> ...
 ```
@@ -158,9 +178,9 @@ Every threshold is a flag (`--help`).
 
 | Topic | From this output |
 | --- | --- |
-| `/ego/vio/pose` | parent `ego_vio_world`, child `ego_head` (rectified left camera); one pose per row; a new map = a new origin (start a new `ego_vio_world_<map>` frame, or reset; the axes are shared) |
-| `/ego/vio/system_info` | `axis_convention`, world/head frame names, per-map health and hand-off grades from `orientation_report.json` |
-| `/tf_static` | `ego_head` → IMU from `calibration.json` (`rectified_extrinsics.T_cam0rect_imu`) |
+| `/ego/vio/pose` | produced by the existing exporter from `trajectory.npz`: parent `ego_vio_world`, child `ego_imu`, already correct A.2 (one pose per row; each map restarts at its own origin, axes shared) |
+| `/ego/vio/system_info` | per-map health and hand-off grades are in `orientation_report.json` if wanted |
+| `/tf_static` | cameras on `ego_imu`, from the calibration, as the exporter already does |
 
 ### Limitations
 

@@ -42,6 +42,11 @@ def main(argv=None):
         p.add_argument("--out", required=True)
         p.add_argument("--render", help="also write a check video here")
         p.add_argument("--video", help="left_rectified.mp4 for --render (S3 mode downloads it if omitted)")
+        if name == "reorient":
+            p.add_argument("--convention", choices=("mcap", "a2-camera"), default="mcap",
+                           help="trajectory.npz convention: mcap (default; world z-up <- IMU, what the MCAP "
+                                "exporter expects) or a2-camera (Opeth A.2 <- rectified camera); the other is "
+                                "written as a sidecar npz")
         if name == "process":
             p.add_argument("--mod-slam", help="optional local mod-slam dir (vio/trajectory.txt) to bridge long gaps")
             p.add_argument("--no-reference", action="store_true", help="do not use mod-slam for long gaps")
@@ -100,7 +105,7 @@ def _reorient(a, ap, seg, cfg, wd):
     from .deliverable import write
     from .reorient import reorient
     res = reorient(seg, cfg)
-    paths = write(res, seg, a.out)
+    paths = write(res, seg, a.out, a.convention)
     summary = dict(segment=res["name"], n_maps=len(res["maps"]), heading_anchor_map=res["anchor_map"],
                    healthy_maps=res["healthy_maps"], flagged_maps=res["unhealthy_maps"],
                    bridges=[(b["from_map"], b["to_map"], b["bridge_s"], b["quality"]) for b in res["bridges"]],

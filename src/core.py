@@ -35,9 +35,12 @@ class Config:
     frame_exact_max_deg: float = 1e-4 # export convention: the exporter levels with the same data, so the
                                       # matching extrinsic gives a residual of exactly 0 (< 1e-6 on 133 maps;
                                       # the other extrinsic >= 0.0045 deg)
+    frame_approx_max_deg: float = 0.05 # fallback when neither extrinsic is exact (e.g. the exporter's
+    frame_ratio_min: float = 3.0      # averaging changed): the smaller residual must be <= this and at
+                                      # least frame_ratio_min x smaller than the other, else unrecognised
     rate_rel_max: float = 0.25        # reorient: 3-axis rate residual RMS / gyro rate RMS (scale-free; an
                                       # absolute deg/s limit flags fast but good motion). Position-healthy
-                                      # maps median 0.06, p97 ~0.25; diverged median 0.36
+                                      # maps median 0.06, p95 0.20, p97 0.23; diverged median 0.36
     rate_corr3_min: float = 0.95      # reorient: correlation of the 3-axis rates (healthy p5 0.98)
     grav_window_s: float = 10.0       # reorient: windowed gravity residual, window length
     grav_p90_max_deg: float = 2.0     # reorient: p90 over windows (healthy p99 1.7; diverged median 2.1)
@@ -126,7 +129,7 @@ class MapInfo:
     reasons: list = field(default_factory=list)
     tilt_raw_deg: float | None = None      # gravity tilt with T_cam0_imu, before re-levelling
     tilt_rect_deg: float | None = None     # same with the rectified extrinsic (diagnostic)
-    export_convention: str | None = None   # raw_cam0 | rectified_cam0 | unrecognised
+    export_convention: str | None = None   # raw_cam0 | rectified_cam0 (exact), *_approx (margin), unrecognised
     speed_p99: float | None = None
     speed_max: float | None = None
     gyro_corr: float | None = None
@@ -144,37 +147,73 @@ class GapInfo:
     heading_quality: str
 
 
-def _check_map(seg, sel, R_raw, R_rect, cfg):
+def _tilts(seg, sel, R_raw, R_rect):
+    """Levelling residual (deg) of one map with each candidate extrinsic. The exporter
+    (make_deliverables_multi.load_segment) levels each map with mean(R_wb @ acc), using np.interp at
+    these same times, so the extrinsic it really used gives exactly 0."""
+    ti = seg.t[sel] + seg.imu_offset_s
+    Rc = seg.R_w_cam0[sel]
+    f = np.stack([np.interp(ti, seg.t_imu, seg.acc[:, k]) for k in range(3)], 1)
+    return (_tilt_deg(np.einsum("nij,jk,nk->ni", Rc, R_raw, f).mean(0)),
+            _tilt_deg(np.einsum("nij,jk,nk->ni", Rc, R_rect, f).mean(0)))
+
+
+def export_convention(tilts, cfg):
+    """ONE convention per segment (an exporter run uses one extrinsic for every map), from the
+    per-map residuals [(raw, rect), ...]:
+      raw_cam0 / rectified_cam0              every map exactly 0 with that extrinsic
+      raw_cam0_approx / rectified_cam0_approx not exact (the exporter's numerics changed), but the
+                                              pooled RMS residual of one extrinsic is <= frame_approx_max_deg
+                                              and frame_ratio_min x smaller than the other's
+      unrecognised                            anything else; never a bare argmin (with a changed time
+                                              alignment raw reads up to 0.24 deg, rectified as low as 0.018)"""
+    tilts = [t for t in tilts if t is not None]
+    if not tilts:
+        return "unrecognised"
+    raw, rect = np.array(tilts, float).T
+    if (raw <= cfg.frame_exact_max_deg).all():
+        return "raw_cam0"
+    if (rect <= cfg.frame_exact_max_deg).all():
+        return "rectified_cam0"
+    r_raw, r_rect = float(np.sqrt(np.mean(raw ** 2))), float(np.sqrt(np.mean(rect ** 2)))
+    lo, hi = sorted((r_raw, r_rect))
+    if lo <= cfg.frame_approx_max_deg and hi >= cfg.frame_ratio_min * lo:
+        return "raw_cam0_approx" if r_raw < r_rect else "rectified_cam0_approx"
+    return "unrecognised"
+
+
+def check_maps(seg, R_raw, R_rect, cfg):
+    """Per-map checks with the segment's export convention decided once over all maps.
+    -> (convention, [(map_id, sel, info, data), ...]) in map-id order."""
+    out, tilts = [], []
+    for k in list(dict.fromkeys(seg.map_id.tolist())):
+        sel = seg.map_id == k
+        long_enough = seg.t[sel][-1] - seg.t[sel][0] >= cfg.min_map_s
+        tilts.append(_tilts(seg, sel, R_raw, R_rect) if long_enough else None)
+        out.append((k, sel))
+    conv = export_convention(tilts, cfg)
+    return conv, [(k, sel) + _check_map(seg, sel, R_raw, R_rect, cfg, conv) for k, sel in out]
+
+
+def _check_map(seg, sel, R_raw, R_rect, cfg, convention="raw_cam0"):
     t, p, Rc = seg.t[sel], seg.p[sel], seg.R_w_cam0[sel]
     info = MapInfo(int(seg.map_id[sel][0]), int(sel.sum()), float(t[0]), float(t[-1]), True)
-    R_wi = Rc @ R_raw
     ti = t + seg.imu_offset_s
     inside = (ti >= seg.t_imu[0]) & (ti <= seg.t_imu[-1])
     if inside.sum() < 30 or t[-1] - t[0] < cfg.min_map_s:
         info.kept = False
         info.reasons.append(f"too short ({t[-1] - t[0]:.1f} s)")
         return info, None
-    # Export-convention guard. The exporter (make_deliverables_multi.load_segment) levels each map
-    # with mean(R_wb @ acc) using np.interp at these same times, so with the extrinsic it really
-    # used the residual is exactly 0. Exactness tells raw from rectified even when R1 barely tilts
-    # gravity (a 0.5 deg tolerance cannot: 49 of 132 maps have tilt_rect < 0.5 deg).
-    f_all = np.stack([np.interp(ti, seg.t_imu, seg.acc[:, k]) for k in range(3)], 1)
-    up_raw = np.einsum("nij,jk,nk->ni", Rc, R_raw, f_all).mean(0)
-    up_rect = np.einsum("nij,jk,nk->ni", Rc, R_rect, f_all).mean(0)
-    info.tilt_raw_deg, info.tilt_rect_deg = _tilt_deg(up_raw), _tilt_deg(up_rect)
-    if info.tilt_raw_deg <= cfg.frame_exact_max_deg:
-        info.export_convention = "raw_cam0"
-    elif info.tilt_rect_deg <= cfg.frame_exact_max_deg:
-        info.export_convention = "rectified_cam0"
-        R_wi = Rc @ R_rect                       # identified exactly, so use it (and report it)
-    else:
-        info.export_convention = "unrecognised"
-        info.reasons.append(f"export convention not recognised: gravity residual {info.tilt_raw_deg:.4f} deg "
-                            f"with T_cam0_imu, {info.tilt_rect_deg:.4f} deg with T_cam0rect_imu (exactly 0 expected)")
+    # export convention: decided for the whole segment by export_convention(); reported per map
+    info.tilt_raw_deg, info.tilt_rect_deg = _tilts(seg, sel, R_raw, R_rect)
+    info.export_convention = convention
+    R_wi = Rc @ (R_rect if convention.startswith("rectified") else R_raw)
+    if convention == "unrecognised":
+        info.reasons.append(f"export convention not recognised for this segment: gravity residual "
+                            f"{info.tilt_raw_deg:.4f} deg with T_cam0_imu, {info.tilt_rect_deg:.4f} deg with "
+                            f"T_cam0rect_imu (exactly 0 expected; no clear margin either)")
     f = interp3(ti[inside], seg.t_imu, seg.acc)
     up = np.einsum("nij,nj->ni", R_wi[inside], f).mean(0)
-    if info.tilt_raw_deg > cfg.frame_tilt_max_deg and info.export_convention == "unrecognised":
-        info.reasons.append(f"frame check: gravity {info.tilt_raw_deg:.2f} deg off with T_cam0_imu")
     # health
     sp = _speeds_10hz(t, p)
     if len(sp):
@@ -209,13 +248,13 @@ def process(seg, cfg: Config | None = None) -> dict:
 
     # ---- 1. per map
     maps, kept = [], []
-    for k in np.unique(seg.map_id):
-        info, data = _check_map(seg, seg.map_id == k, R_raw, R_rect, cfg)
+    conv, checked = check_maps(seg, R_raw, R_rect, cfg)
+    if conv != "raw_cam0":
+        alarms.append(f"ORB-SLAM3 export convention: {conv}")
+    for k, _, info, data in checked:
         maps.append(info)
         if info.kept:
             kept.append((info, data))
-        if any("rotation convention changed" in r for r in info.reasons):
-            alarms.append(f"map {k}: " + info.reasons[0])
     kept.sort(key=lambda x: x[1]["t"][0])
     if not kept:
         return dict(ok=False, segment=seg.name, maps=[asdict(m) for m in maps], gaps=[], alarms=alarms + ["no usable map"])
@@ -298,13 +337,24 @@ def process(seg, cfg: Config | None = None) -> dict:
     R_oh = np.einsum("ij,njk->nik", R_ow, R_wh)
     R_oi = np.einsum("ij,njk->nik", R_ow, R_wi)
 
-    # self-check: mean specific force must point to -Y (up) in the operator world
-    ti = t + seg.imu_offset_s
-    ins = (ti >= seg.t_imu[0]) & (ti <= seg.t_imu[-1])
-    fo = np.einsum("nij,nj->ni", R_oi[ins], interp3(ti[ins], seg.t_imu, seg.acc)).mean(0)
-    up_err = float(np.degrees(np.arccos(np.clip(-fo[1] / np.linalg.norm(fo), -1, 1))))
-    if up_err > 1.0:
-        alarms.append(f"self-check: gravity {up_err:.2f} deg off -Y in the output frame")
+    # self-check, windowed: every map is levelled to its own mean specific force and stitching only
+    # adds yaw, so a whole-trajectory mean is vertical by construction. Measure per map in
+    # cfg.grav_window_s windows instead (needs >= 2 windows) and report the worst map's p90.
+    ti = np.clip(t + seg.imu_offset_s, seg.t_imu[0], seg.t_imu[-1])
+    fo = np.einsum("nij,nj->ni", R_oi, interp3(ti, seg.t_imu, seg.acc))
+    up_err = None
+    for m in np.unique(mid):
+        res = []
+        tm = t[mid == m]
+        for a in np.arange(tm[0], tm[-1] - cfg.grav_window_s / 2, cfg.grav_window_s):
+            w = (mid == m) & (t >= a) & (t < a + cfg.grav_window_s)
+            if w.sum() > 50:
+                v = fo[w].mean(0)
+                res.append(float(np.degrees(np.arccos(np.clip(-v[1] / np.linalg.norm(v), -1, 1)))))
+        if len(res) >= 2:
+            up_err = max(up_err or 0.0, float(np.percentile(res, 90)))
+    if up_err is not None and up_err > cfg.grav_p90_max_deg:
+        alarms.append(f"self-check: gravity {up_err:.2f} deg off -Y (windowed p90, worst map) in the output frame")
 
     dropped = [m.map_id for m in maps if not m.kept]
     return dict(

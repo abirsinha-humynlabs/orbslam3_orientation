@@ -23,7 +23,7 @@ from dataclasses import asdict
 
 import numpy as np
 
-from .core import Config, _check_map, _gyro_mean_rate, _rates
+from .core import Config, _gyro_mean_rate, _rates, check_maps
 from .geometry import integrate_gyro, interp3, rot_z, yaw_between
 
 FRAME_NOTE = ("OPETH_A2 cam0_rectified (already A.2: do not re-rotate). Opeth A.2 axes: +X right, +Y down (gravity), +Z forward (operator facing at the start "
@@ -31,6 +31,18 @@ FRAME_NOTE = ("OPETH_A2 cam0_rectified (already A.2: do not re-rotate). Opeth A.
               "carried across map breaks by the gyroscope). rotation = world <- rectified "
               "left camera (+X image right, +Y image down, +Z optical axis). position_m = that camera's "
               "centre. EACH SEGMENT HAS ITS OWN ORIGIN (0,0,0 at its first pose); headings are shared.")
+# Default deliverable ("mcap" convention): exactly what the MCAP exporter's load_orbslam3 assumes,
+# so its existing fixed rotation produces Opeth A.2 with no downstream change:
+#   world  gravity-aligned, Z-up: +x right, +y forward, +z up (same heading in every map)
+#   rotation world <- IMU body; position IMU origin (per-map origin)
+# A.2 = R_ZUP_TO_A2 @ this (-90 deg about X, = bitrobot_to_mcap.R_DOC_OKVIS).
+R_ZUP_TO_A2 = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]])
+FRAME_NOTE_ZUP = ("ORB_ORIENTATION imu_zup: rotation = world <- IMU, position_m = IMU origin; world gravity-aligned "
+                  "+x right, +y forward, +z up, the SAME heading in every map (operator facing at the start of the "
+                  "heading-anchor map, carried across map breaks by the gyroscope). Opeth A.2 = R_x(-90 deg) applied "
+                  "to this (+X right, +Y down, +Z forward). EACH SEGMENT HAS ITS OWN ORIGIN.")
+POSE_HEADER_ZUP = ("timestamp_s x y z r00..r22  (world <- IMU, IMU origin; world z-up, x right, y forward, same heading "
+                   "in every segment; Opeth A.2 = R_x(-90deg) applied; THIS SEGMENT'S OWN ORIGIN)")
 POSE_HEADER = ("timestamp_s x y z r00..r22  (Opeth A.2: +X right, +Y down, +Z forward; rotation = world <- "
                "rectified left camera; THIS SEGMENT'S OWN ORIGIN, heading shared with the other segments)")
 
@@ -71,7 +83,7 @@ def _orientation_metrics(seg, M, bias, cfg):
     if len(res) >= 2:                      # one window = the whole-map mean, which is 0 by construction
         out["gravity_window_p90_deg"], out["gravity_window_max_deg"] = float(np.percentile(res, 90)), max(res)
     why = []
-    if M["info"].export_convention != "raw_cam0" and M["info"].export_convention != "rectified_cam0":
+    if M["info"].export_convention == "unrecognised":
         why.append("export convention not recognised")
     if out["rate_rms_dps"] is None:
         why.append("too few poses for the rate test")
@@ -147,12 +159,10 @@ def reorient(seg, cfg: Config | None = None) -> dict:
     alarms = list(seg.notes)
 
     # ---- per map, in ORB-SLAM3's row order (by segment id, then time)
-    ids = list(dict.fromkeys(seg.map_id.tolist()))
+    conv, checked = check_maps(seg, R_raw, R_rect, cfg)
     maps = []
-    for k in ids:
-        sel = seg.map_id == k
-        info, data = _check_map(seg, sel, R_raw, R_rect, cfg)
-        R_wi = seg.R_w_cam0[sel] @ R_raw
+    for k, sel, info, data in checked:
+        R_wi = seg.R_w_cam0[sel] @ (R_rect if conv.startswith("rectified") else R_raw)
         if data is None:                                   # too short to re-level: use ORB-SLAM3's levelling
             data = dict(t=seg.t[sel], p=seg.p[sel], R=R_wi)
         maps.append(dict(id=k, sel=sel, info=info, t=data["t"], p=data["p"], R=data["R"]))
@@ -178,11 +188,14 @@ def reorient(seg, cfg: Config | None = None) -> dict:
     any_healthy = any(M["info"].kept for M in maps)
     if maps[anchor]["orient_ok"] and not any_healthy:
         alarms.append("no healthy map: the heading anchor and sources are maps whose position diverged")
-    if any(M["info"].export_convention == "rectified_cam0" for M in maps):
+    if conv.endswith("_approx"):
+        alarms.append(f"ORB-SLAM3 export convention identified only approximately ({conv}): the residual is not "
+                      "exactly 0, so the exporter's numerics changed upstream")
+    if conv.startswith("rectified"):
         alarms.append("ORB-SLAM3 export convention changed upstream: rotation is world <- RECTIFIED cam0 "
-                      "(identified exactly and handled)")
-    if any(M["info"].export_convention == "unrecognised" for M in maps):
-        alarms.append("ORB-SLAM3 export convention not recognised on some map(s): their orientation is not trusted")
+                      "(identified and handled)")
+    if conv == "unrecognised":
+        alarms.append("ORB-SLAM3 export convention not recognised: no map's orientation is trusted")
     yaw = {anchor: 0.0}
     bridges = []
     seg_bias, n_bias = _segment_bias(seg, maps)
@@ -284,6 +297,9 @@ def reorient(seg, cfg: Config | None = None) -> dict:
     # ---- write back in the original row order
     rotation = np.empty_like(seg.R_w_cam0)
     position = np.empty_like(seg.p)
+    rotation_zup = np.empty_like(seg.R_w_cam0)
+    position_zup = np.empty_like(seg.p)
+    R_ow_zup = R_ZUP_TO_A2.T @ R_ow                                   # Z-up operator world <- ORB world
     report_maps = []
     for i, M in enumerate(maps):
         Rz = rot_z(yaw.get(i, 0.0))
@@ -295,6 +311,9 @@ def reorient(seg, cfg: Config | None = None) -> dict:
         # rows of this map in the ORIGINAL file order (M["t"] is the same order as seg.t[sel])
         rotation[M["sel"]] = R_o
         position[M["sel"]] = p_o
+        p_i = (Rz @ M["p"].T).T                                       # IMU origin, levelled ORB world
+        rotation_zup[M["sel"]] = np.einsum("ij,njk->nik", R_ow_zup, R_wi)
+        position_zup[M["sel"]] = (R_ow_zup @ (p_i - p_i[0]).T).T
         d = asdict(M["info"])
         d.update(healthy=d.pop("kept"), health_issues=d.pop("reasons"), orientation_trusted=M["orient_ok"],
                  heading_anchor=(i == anchor), heading_shared_reliably=bool(heading_ok.get(i, False)),
@@ -302,8 +321,9 @@ def reorient(seg, cfg: Config | None = None) -> dict:
                  **{k: (None if v is None else round(v, 4)) for k, v in M["metrics"].items()})
         report_maps.append(d)
 
-    return dict(rate_test_bias_rad_s=[round(float(x), 5) for x in rate_bias], gyro_bias_rad_s=None if seg_bias is None else [round(float(x), 5) for x in seg_bias],
-                gyro_bias_windows=n_bias, name=seg.name, rotation=rotation, position_m=position, timestamp_s=seg.t, map_id=seg.map_id,
+    return dict(export_convention=conv, rate_test_bias_rad_s=[round(float(x), 5) for x in rate_bias], gyro_bias_rad_s=None if seg_bias is None else [round(float(x), 5) for x in seg_bias],
+                gyro_bias_windows=n_bias, name=seg.name, rotation=rotation, position_m=position,
+                rotation_imu_zup=rotation_zup, position_imu_zup=position_zup, frame_note_zup=FRAME_NOTE_ZUP, timestamp_s=seg.t, map_id=seg.map_id,
                 healthy_maps=[m["map_id"] for m in report_maps if m["healthy"]],
                 unhealthy_maps=[m["map_id"] for m in report_maps if not m["healthy"]], maps=report_maps, bridges=bridges, alarms=alarms, anchor_map=maps[anchor]["id"],
                 imu_offset_s=seg.imu_offset_s, imu_offset_source=seg.offset_source, frame_note=FRAME_NOTE,

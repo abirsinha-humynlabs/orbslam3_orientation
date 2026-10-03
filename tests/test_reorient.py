@@ -3,7 +3,8 @@
 Known head motion -> ORB-SLAM3-style deliverable (trajectory.npz + segments/*.txt + manifest,
 three maps, each from (0,0,0) with a random heading, rotation = world <- raw cam0) -> reorient.
 Checks: identical file names / keys / dtypes / rows / timestamps; every map still starts at
-(0,0,0); every map in the SAME A.2 axes (one world rotation fits all maps); +Y = gravity-down;
+(0,0,0); the default trajectory.npz, rotated by the MCAP exporter's fixed R_x(-90), equals the A.2
+camera sidecar; every map in the SAME axes (one world rotation fits all maps); gravity correct;
 ORB-SLAM3's own folder untouched.
 
   python -m pytest tests/  (or: python tests/test_reorient.py)
@@ -21,7 +22,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from test_stitch import make_segment                               # noqa: E402
 from src.core import Config                       # noqa: E402
 from src.deliverable import write                 # noqa: E402
-from src.io import load_local                     # noqa: E402
+from src.io import load_local, read_npz           # noqa: E402
 from src.reorient import reorient                 # noqa: E402
 
 
@@ -69,9 +70,9 @@ def test_reorient_deliverable():
         write(res, seg, out)
         assert _digest(orb) == before, "ORB-SLAM3's folder was modified"
 
-        a, b = np.load(os.path.join(orb, "trajectory.npz")), np.load(os.path.join(out, "trajectory.npz"))
-        assert a.files == b.files
-        for k in a.files:
+        a, b = read_npz(os.path.join(orb, "trajectory.npz")), read_npz(os.path.join(out, "trajectory.npz"))
+        assert list(a) == list(b)
+        for k in a:
             assert a[k].shape == b[k].shape and (a[k].dtype == b[k].dtype or k == "frame_note"), k
         for k in ("segment", "timestamp_s", "segment_files"):
             assert np.array_equal(a[k], b[k]), k
@@ -83,8 +84,22 @@ def test_reorient_deliverable():
             assert np.allclose(txt[:, 4:].reshape(-1, 3, 3), b["rotation"][s], atol=1e-8)
             assert np.allclose(b["position_m"][s][0], 0), "each map must keep its own origin"
 
-        # all maps in ONE world: a single rotation maps the true world to the output world
-        R_out = b["rotation"]
+        # default convention: trajectory.npz = world z-up <- IMU, which the MCAP exporter turns into
+        # A.2 with its fixed R_x(-90). Emulate exactly that and compare with the A.2 camera sidecar.
+        from src.reorient import R_ZUP_TO_A2
+        c = read_npz(os.path.join(out, "trajectory_a2_camera.npz"))
+        R_rect = tr["R_rect"]
+        R_loader = np.einsum("ij,njk->nik", R_ZUP_TO_A2, b["rotation"])           # what load_orbslam3 publishes
+        R_cam_from_loader = np.einsum("nij,kj->nik", R_loader, R_rect)
+        d = np.degrees(np.arccos(np.clip((np.einsum("nij,nij->n", R_cam_from_loader, c["rotation"]) - 1) / 2, -1, 1)))
+        assert d.max() < 1e-4, f"loader-emulated pose != A.2 camera sidecar ({d.max():.2e} deg)"
+        assert np.array_equal(c["timestamp_s"], b["timestamp_s"]) and list(c) == list(b)
+        # the npz holds the IMU pose: gravity (specific force) must point to +z of its world
+        f = np.stack([np.interp(b["timestamp_s"] + seg.imu_offset_s, seg.t_imu, seg.acc[:, i]) for i in range(3)], 1)
+        up = np.einsum("nij,nj->ni", b["rotation"], f).mean(0)
+        assert np.degrees(np.arccos(up[2] / np.linalg.norm(up))) < 0.5
+        # all maps in ONE world (A.2 camera sidecar): a single rotation maps true world to output
+        R_out = c["rotation"]
         R_true_h = np.einsum("nij,kj->nik", tr["R_wi"], tr["R_rect"])
         D0 = R_out[0] @ R_true_h[0].T
         err = [np.degrees(np.arccos(np.clip((np.trace(R_out[i] @ (D0 @ R_true_h[i]).T) - 1) / 2, -1, 1)))
@@ -121,6 +136,21 @@ def test_guards():
     r = reorient(seg, cfg)
     assert all(m["export_convention"] == "unrecognised" and not m["orientation_trusted"] for m in r["maps"])
     assert any("not recognised" in a for a in r["alarms"])
+    # N1: not exact but a clear margin -> identified approximately (trusted, alarm), not unrecognised
+    seg, _ = make_segment()
+    seg.R_w_cam0 = np.einsum("ij,njk->nik", exp_so3([np.radians(0.01), 0, 0]), seg.R_w_cam0)
+    r = reorient(seg, cfg)
+    assert all(m["export_convention"] == "raw_cam0_approx" and m["orientation_trusted"] for m in r["maps"])
+    assert any("only approximately" in a for a in r["alarms"])
+    # N1: no clear margin (raw 0.02 deg vs rectified 0.03 deg) -> unrecognised, never a bare argmin
+    seg, _ = make_segment()
+    seg.calib = json.loads(json.dumps(seg.calib))
+    T = np.array(seg.calib["imu"]["T_cam0_imu"])
+    T[:3, :3] = exp_so3([0, np.radians(0.02), 0]) @ T[:3, :3]
+    seg.calib["rectified_extrinsics"]["T_cam0rect_imu"] = T.tolist()
+    seg.R_w_cam0 = np.einsum("ij,njk->nik", exp_so3([np.radians(0.02), 0, 0]), seg.R_w_cam0)
+    r = reorient(seg, cfg)
+    assert all(m["export_convention"] == "unrecognised" for m in r["maps"])
     # E5: a map whose tilt drifts (2 deg over its length) -> windowed gravity flags it,
     # although its whole-map mean is levelled to 0
     seg, _ = make_segment()
@@ -142,11 +172,17 @@ def test_guards():
         write(reorient(seg, cfg), seg, out)
         assert json.load(open(os.path.join(out, "status.json"))) == {"status": "ok"}
         man = json.load(open(os.path.join(out, "segments_manifest.json")))
-        assert man["axis_convention"] == "opeth_a2" and man["rotation_frame"] == "cam0_rectified"
-        assert str(np.load(os.path.join(out, "trajectory.npz"))["frame_note"]).startswith("OPETH_A2")
+        assert man["pose_frame"] == "imu" and man["axis_convention"] == "zup_then_rx_minus90_to_opeth_a2"
+        assert str(read_npz(os.path.join(out, "trajectory.npz"))["frame_note"]).startswith("ORB_ORIENTATION imu_zup")
+        assert str(read_npz(os.path.join(out, "trajectory_a2_camera.npz"))["frame_note"]).startswith("OPETH_A2")
+        out2 = os.path.join(tmp, "out2")                         # the other convention on request
+        write(reorient(seg, cfg), seg, out2, "a2-camera")
+        man2 = json.load(open(os.path.join(out2, "segments_manifest.json")))
+        assert man2["axis_convention"] == "opeth_a2" and os.path.exists(os.path.join(out2, "trajectory_imu_zup.npz"))
 
 
 if __name__ == "__main__":
     print(f"ok: max orientation error across all maps {test_reorient_deliverable():.3f} deg")
     test_guards()
-    print("ok: guards (rectified convention, unknown convention, tilt drift, file carry-over, markers)")
+    print("ok: guards (rectified convention, unknown convention, approximate / ambiguous convention, "
+          "tilt drift, file carry-over, markers)")

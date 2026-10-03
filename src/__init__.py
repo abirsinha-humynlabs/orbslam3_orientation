@@ -4,4 +4,4 @@ files and structure (the delivered mode). process(): experimental stitched traje
 from .core import Config, process  # noqa: F401
 from .io import load_local, load_s3  # noqa: F401
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"

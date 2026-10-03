@@ -81,7 +81,7 @@ def test_stitch_and_axes():
     seg, tr = make_segment()
     res = process(seg, Config(speed_p99_max=5.0))
     assert res["ok"] and len(res["gaps"]) == 2, res["alarms"]
-    assert res["gravity_check_deg"] < 0.5
+    assert res["gravity_check_deg"] is not None and res["gravity_check_deg"] < 1.0
     # compare against truth expressed in the same operator world: fix the world by the first pose
     R_oh = res["R_world_head"]
     R_true_h = np.einsum("nij,kj->nik", tr["R_wi"], tr["R_rect"])
@@ -102,6 +102,24 @@ def test_stitch_and_axes():
     return np.max(err), perr.max()
 
 
+
+
+
+def test_gravity_check_can_fail():
+    """The windowed gravity check must catch a map whose tilt drifts. A whole-trajectory mean
+    could not: each map is levelled to its own mean specific force."""
+    seg, _ = make_segment()
+    s = seg.map_id == 0
+    ang = np.radians(8.0) * (seg.t[s] - seg.t[s][0]) / (seg.t[s][-1] - seg.t[s][0]) - np.radians(4.0)
+    seg.R_w_cam0[s] = np.stack([exp_so3([a, 0, 0]) @ R for a, R in zip(ang, seg.R_w_cam0[s])])
+    level_like_exporter(seg)
+    res = process(seg, Config(speed_p99_max=5.0, grav_p90_max_deg=1.0))
+    assert res["gravity_check_deg"] > 1.0, res["gravity_check_deg"]
+    assert any("self-check: gravity" in a for a in res["alarms"])
+    return res["gravity_check_deg"]
+
+
 if __name__ == "__main__":
     e, pe = test_stitch_and_axes()
     print(f"ok: max orientation error {e:.3f} deg, max position error {pe:.3f} m")
+    print(f"ok: windowed gravity check catches a drifting map ({test_gravity_check_can_fail():.2f} deg)")

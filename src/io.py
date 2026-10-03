@@ -62,8 +62,15 @@ def _read_tum(path):
     return dict(t=d[:, 0], p=d[:, 1:4], R=R, name="mod-slam")
 
 
+def read_npz(path):
+    """All arrays of an npz as a dict, in file order, with the file closed again (an open NpzFile
+    keeps its zip handle, which blocks deleting the folder on Windows)."""
+    with np.load(path, allow_pickle=False) as f:
+        return {k: f[k] for k in f.files}
+
+
 def load_local(orb_dir, inputs_dir, ref_dir=None, name=""):
-    z = np.load(os.path.join(orb_dir, "trajectory.npz"), allow_pickle=False)
+    z = read_npz(os.path.join(orb_dir, "trajectory.npz"))
     t = z["timestamp_s"].astype(float)
     order = np.lexsort((t, z["segment"]))
     seg = Segment(
