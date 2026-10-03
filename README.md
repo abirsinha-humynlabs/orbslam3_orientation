@@ -135,6 +135,26 @@ rendered clips, run through the monorepo's `bitrobot_to_mcap.load_orbslam3` as i
 - Gravity points to −Y: windowed p90 0.3–1.1° on healthy maps.
 - The operator's starting facing is +Z (X component ≤ 0.02).
 
+**ORB-SLAM3 original vs post-processed, through the exporter** (`tools/compare_original_vs_post.py`):
+both folders go through the unmodified `load_orbslam3`. The published "`ego_imu`" orientation is
+then tested against the IMU's own gyroscope (which frame the published rotation rates live in) and
+accelerometer (gravity → −Y). Six clips:
+
+| Clip | Camera→IMU angle (calibration) | Original: published "IMU" vs real IMU | Original vs raw camera | Post-processed vs real IMU | Gravity vs −Y, healthy maps: original → post |
+| --- | --- | --- | --- | --- | --- |
+| PLN-024 | 100.2° | 100.0° | 0.2° | **0.2°** | 83.4° → **0.2°** |
+| PIP-305 | 98.7° | 98.3° | 0.6° | **0.6°** | 92.1° → **0.4°** |
+| YTF-753 | 104.5° | 104.3° | 0.3° | **0.3°** | 104.6° → **0.4°** |
+| CAM-352 | 98.6° | 98.6° | 1.6° | **1.6°** | 98.9° → **1.6°** (all maps; none healthy) |
+| akai-ego-014 | 90.8° | 90.6° | 0.2° | **0.2°** | 58.8° → **0.6°** |
+| akai-ego-007 | 90.7° | 90.9° | 0.5° | **0.5°** | 31.1° → **0.4°** |
+
+- **From the original folder,** the exporter publishes the raw left camera as the IMU: 90–104°
+  off, matching the calibration angle to 0.4° (reviewer finding E1).
+- **From the post-processed folder,** the published body frame is the IMU. The 0.2–1.6° left
+  over is identical to the original's camera match: it's how closely ORB-SLAM3's own rotation
+  follows the gyro, not an error added by the post-process.
+
 **Batch results** (all 39 cached multi-map runs, 113 maps, after the review fixes of 2026-10-03):
 - All 39 outputs have the same structure as ORB-SLAM3's: keys, shapes and timestamps.
 - Export convention identified exactly as `raw_cam0` on all 113 maps.
@@ -160,6 +180,8 @@ python -m src reorient --bucket prod-egc-stereo-v2-data --profile prod \
 
 python tests/test_reorient.py
 python tools/check_with_mcap_loader.py --monorepo <monorepo> --out <output dir> --inputs <chunking dir>
+python tools/compare_original_vs_post.py --monorepo <monorepo> --orbslam3 <ORB-SLAM3 seg dir> \
+    --post <output dir> --inputs <chunking dir>
 python tools/validate_reorient.py cut  <segdir> ...
 python tools/validate_reorient.py real <segdir> ...
 ```

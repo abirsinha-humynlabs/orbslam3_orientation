@@ -40,29 +40,54 @@ def ang(A, B):
     return np.degrees(np.arccos(np.clip((np.einsum("nij,nij->n", A, B) - 1) / 2, -1, 1)))
 
 
+def import_loader(monorepo):
+    sys.path.insert(0, os.path.join(monorepo, "stereo-pipeline-v2", "mcap_export"))
+    import bitrobot_to_mcap
+    return bitrobot_to_mcap
+
+
+def load_published(B, folder, tmp):
+    """Run the unmodified load_orbslam3 on folder. -> (t on the IMU clock, R = published
+    ego_vio_world <- ego_imu, files that had to be stubbed). Real ORB-SLAM3 folders (and outputs
+    copied from them) carry status.json and segments_manifest.json; local test copies may not, so
+    those get stubs in a temporary copy and the loader takes the time offset from report.json."""
+    stubs = {"status.json": {"status": "ok"}, "segments_manifest.json": {}}
+    missing = [f for f in stubs if not os.path.exists(os.path.join(folder, f))]
+    src = folder
+    if missing:
+        src = tempfile.mkdtemp(prefix="stubbed_", dir=tmp)
+        shutil.copytree(folder, src, dirs_exist_ok=True)
+        for f in missing:
+            json.dump(stubs[f], open(os.path.join(src, f), "w"))
+    poses, run, check, tau = B.load_orbslam3(src, Path(tmp))
+    return np.array([p[0] for p in poses]), np.stack([q2m(p[2]) for p in poses]), missing
+
+
+def gravity_windows(t, R, sel, t_imu, acc, window=10.0):
+    """Angle (deg) between the mean specific force, rotated into the published world, and A.2 up
+    (-Y), per window of the poses in sel (windows need > 50 poses)."""
+    f = np.einsum("nij,nj->ni", R, interp3(np.clip(t, t_imu[0], t_imu[-1]), t_imu, acc))
+    out = []
+    for t0 in np.arange(t[sel][0], t[sel][-1] - window / 2, window):
+        m = sel & (t >= t0) & (t < t0 + window)
+        if m.sum() > 50:
+            v = f[m].mean(0)
+            out.append(float(np.degrees(np.arccos(np.clip(-v[1] / np.linalg.norm(v), -1, 1)))))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--monorepo", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--inputs", required=True)
     a = ap.parse_args()
-    sys.path.insert(0, os.path.join(a.monorepo, "stereo-pipeline-v2", "mcap_export"))
-    import bitrobot_to_mcap as B
+    B = import_loader(a.monorepo)
 
     tmp = tempfile.mkdtemp(prefix="mcap_check_")
-    src = a.out
-    # real ORB-SLAM3 folders carry these (and the output copies them); local test copies may not
-    stubs = {"status.json": {"status": "ok"}, "segments_manifest.json": {}}
-    missing = [f for f in stubs if not os.path.exists(os.path.join(a.out, f))]
+    t, R, missing = load_published(B, a.out, tmp)                 # published ego_vio_world <- ego_imu
     if missing:
-        src = os.path.join(tmp, "out")
-        shutil.copytree(a.out, src)
-        for f in missing:
-            json.dump(stubs[f], open(os.path.join(src, f), "w"))
         print(f"note: output lacks {', '.join(missing)} (local test copy); used stubs in a temporary copy")
-    poses, run, check, tau = B.load_orbslam3(src, Path(tmp))
-    t = np.array([p[0] for p in poses])
-    R = np.stack([q2m(p[2]) for p in poses])                        # published ego_vio_world <- ego_imu
     z = read_npz(os.path.join(a.out, "trajectory.npz"))
     seg = z["segment"]
     cal = json.load(open(os.path.join(a.inputs, "calibration.json")))
@@ -76,16 +101,9 @@ def main():
     ok &= e.max() < 1e-2
 
     t_imu, acc, _ = _read_imu(os.path.join(a.inputs, "imu.csv"))
-    f = np.einsum("nij,nj->ni", R, interp3(np.clip(t, t_imu[0], t_imu[-1]), t_imu, acc))
     print("2. gravity in the published world, per map (angle of mean specific force to -Y, 10 s windows):")
     for k in np.unique(seg):
-        s = seg == k
-        res = []
-        for t0 in np.arange(t[s][0], t[s][-1] - 5, 10):
-            m = s & (t >= t0) & (t < t0 + 10)
-            if m.sum() > 50:
-                v = f[m].mean(0)
-                res.append(np.degrees(np.arccos(np.clip(-v[1] / np.linalg.norm(v), -1, 1))))
+        res = gravity_windows(t, R, seg == k, t_imu, acc)
         info = next(x for x in rep["maps"] if x["map_id"] == int(k))
         if res:
             print(f"   map {k}: p90 {np.percentile(res, 90):5.2f} deg, max {max(res):5.2f}"

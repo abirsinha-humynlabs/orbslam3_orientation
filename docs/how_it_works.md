@@ -215,6 +215,7 @@ segment with no healthy map at all, which raises an alarm.
 | **Real breaks vs mod-slam** (`tools/validate_reorient.py real`): mod-slam is one continuous map, independent of ORB-SLAM3 | Before the review fixes: graded reliable, median **3.0°** (p90 7.9°); flagged, median 15.5° (max 74°). After them, only 3 hand-offs join two trusted maps: 0.25° (3.8 s), 7.7° (27.6 s), 8.3° (84 s, flagged). |
 | **Axes against the footage** | Optical flow in `left_rectified.mp4` matches the gyro mapped into the rectified camera on both image axes. Gravity in the camera frame matches the visible posture. |
 | **Unmodified MCAP loader** (`tools/check_with_mcap_loader.py`): the monorepo's `bitrobot_to_mcap.load_orbslam3` run on the default output of the six rendered clips | All six PASS: the published pose, with the camera calibration applied, equals the A.2 camera sidecar to 0.002°; gravity → −Y (windowed p90 0.3–1.1° on healthy maps); the starting facing → +Z (X ≤ 0.02). |
+| **Original vs post-processed through the exporter** (`tools/compare_original_vs_post.py`): both folders through the unmodified `load_orbslam3`; the published "`ego_imu`" orientation tested against the IMU's own gyro and accelerometer | Original: published body is the raw camera (0.2–1.6° from it), **90–104° off the real IMU**, matching the calibration angle to 0.4° (E1). Post-processed: **0.2–1.6° off the IMU**, the same leftover as ORB-SLAM3's own rotation-vs-gyro agreement. Gravity (healthy maps) 31–105° → 0.2–0.6°. |
 | **Batch** (39 multi-map runs, 113 maps, after the review fixes) | Structure identical in 39/39. Export convention `raw_cam0` on all 113 maps. 16 maps healthy; 26 with a reliably shared heading (48 before the stricter tests). Hand-offs: 3 good, 7 fair, 9 approximate, 55 poor. 24 runs alarm, mostly "no healthy map". |
 
 Real breaks happen during violent head motion: 150–2000° of rotation inside the gap. So the
@@ -309,6 +310,7 @@ python tools/validate_reorient.py real <segdir> ...
 | `src/reorient.py` | **per-map re-orientation:** anchor, gyro bias, hand-offs, A.2 world |
 | `src/deliverable.py` | writes the ORB-SLAM3-shaped output and `orientation_report.json` |
 | `tools/check_with_mcap_loader.py` | runs the unmodified monorepo MCAP loader on an output folder and checks what it publishes |
+| `tools/compare_original_vs_post.py` | runs the loader on ORB-SLAM3's original folder and on the post-processed folder; tests both published orientations against the IMU's own sensors |
 | `src/simulate.py` | reproduces the exporter's per-map levelling, for tests and validation tools |
 | `src/render.py` | check videos (`render_maps` for reorient) |
 | `src/__main__.py` | CLI (`reorient`, `process`) |
@@ -331,7 +333,7 @@ python tools/validate_reorient.py real <segdir> ...
 
 | # | Finding | Status |
 | --- | --- | --- |
-| E1 | `bitrobot_to_mcap.load_orbslam3` applies only `R_DOC_OKVIS`, never the camera→IMU rotation, and publishes the result as `ego_imu`. | **Confirmed in the monorepo** (89–91° on akai, 98–106° on bitrobot). **Avoided without a monorepo change (v1.3.0):** the default output holds the IMU pose in the Z-up world the loader assumes, so its rotation yields correct A.2. Anyone who exports ORB-SLAM3's original output still gets the bug. |
+| E1 | `bitrobot_to_mcap.load_orbslam3` applies only `R_DOC_OKVIS`, never the camera→IMU rotation, and publishes the result as `ego_imu`. | **Confirmed in the monorepo** (89–91° on akai, 98–106° on bitrobot, from 443 calibrations; measured through the loader on six clips: 90.6–104.3°, `tools/compare_original_vs_post.py`). **Avoided without a monorepo change (v1.3.0):** the default output holds the IMU pose in the Z-up world the loader assumes, so its rotation yields correct A.2. Anyone who exports ORB-SLAM3's original output still gets the bug. |
 | E2 | Fixing E1 with the rectified extrinsic leaves a residual. | **Confirmed.** The residual equals R1: median 2.5°, 5–95% range 1.0–9.0°, max 9.8°. This tool uses the raw extrinsic for the conversion and the rectified one only for the head frame. |
 | E3 | `frame_note` "z is up, gravity-aligned" would be false in stereo mode. | **Mostly not.** In stereo mode the ORB-SLAM3 pipeline exports `pose_frame=camera`, and the exporter levels every map with the accelerometer in both modes. It holds in both; in stereo mode it's one levelling per map, not something the estimator maintains. |
 | E4 | `slam_validation.py` reads column 3 as the optical axis (true); the manifest label `imu` is false. | **Confirmed.** Must change together with any E1 fix in the monorepo. |
