@@ -22,8 +22,8 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from orbslam3_orientation import Config, load_local, process          # noqa: E402
-from orbslam3_orientation.geometry import interp3, rot_z, yaw_between  # noqa: E402
+from src import Config, load_local, process          # noqa: E402
+from src.geometry import interp3, rot_z, yaw_between  # noqa: E402
 
 
 def load(d, ref=True):

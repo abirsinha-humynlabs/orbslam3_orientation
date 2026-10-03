@@ -1,16 +1,16 @@
 """Command line.
 
   # per-map re-orientation, SAME deliverable files as ORB-SLAM3 (no stitching)
-  python -m orbslam3_orientation reorient --orbslam3 ORB_DIR --inputs CHUNK_DIR --out OUT [--render OUT/check.mp4 --video V]
-  python -m orbslam3_orientation reorient --bucket B --profile P --segment <chunking key> --out OUT
+  python -m src reorient --orbslam3 ORB_DIR --inputs CHUNK_DIR --out OUT [--render OUT/check.mp4 --video V]
+  python -m src reorient --bucket B --profile P --segment <chunking key> --out OUT
 
   # local folders
-  python -m orbslam3_orientation process --orbslam3 ORB_DIR --inputs CHUNK_DIR [--mod-slam MOD_DIR] --out OUT
+  python -m src process --orbslam3 ORB_DIR --inputs CHUNK_DIR [--mod-slam MOD_DIR] --out OUT
   # straight from S3 (read-only)
-  python -m orbslam3_orientation process --bucket prod-egc-stereo-v2-data --profile prod \
+  python -m src process --bucket prod-egc-stereo-v2-data --profile prod \
       --segment bitrobot/<site>/<date>/<worker>/<session>/<chunk>/seg_NNN --out OUT
   # also render a check video (needs opencv; --video can be a local left_rectified.mp4)
-  python -m orbslam3_orientation process ... --render OUT/check.mp4 [--video left_rectified.mp4]
+  python -m src process ... --render OUT/check.mp4 [--video left_rectified.mp4]
 
 Exit code: 0 ok, 1 no usable map, 2 ok but with an alarm (frame-convention change, poor stitch,
 gravity self-check failure).
@@ -28,7 +28,7 @@ from .output import save
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="orbslam3_orientation", description=__doc__,
+    ap = argparse.ArgumentParser(prog="python -m src", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name, hlp in (("process", "stitch the maps into one continuous trajectory"),

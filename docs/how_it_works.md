@@ -1,7 +1,7 @@
 # ORB-SLAM3 orientation post-process: how it works
 
 **Code:** `s3://stage-humyn-egocentric-stereo-data/labelling_results/orb_orientation/code/`
-(package `orbslam3_orientation`, version 1.1.0)
+(package in `src/`, version 1.2.0)
 
 **Check videos:** `s3://stage-humyn-egocentric-stereo-data/labelling_results/orb_orientation/<clip>.mp4`,
 each with its re-oriented output folder `<clip>/`.
@@ -244,12 +244,12 @@ When the wearer looks at their own lap while seated, the camera points past vert
 pip install -r requirements.txt          # numpy; boto3 for S3 input; opencv for --render
 
 # local folders
-python -m orbslam3_orientation reorient \
+python -m src reorient \
     --orbslam3 <orbslam3 seg dir> --inputs <chunking seg dir> --out <new folder> \
     [--render check.mp4 --video left_rectified.mp4]
 
 # from S3: read-only, output is local
-python -m orbslam3_orientation reorient --bucket prod-egc-stereo-v2-data --profile prod \
+python -m src reorient --bucket prod-egc-stereo-v2-data --profile prod \
     --segment <dataset>/.../<chunk>/seg_NNN --out <new folder> [--render check.mp4]
 
 python tests/test_reorient.py
@@ -266,14 +266,14 @@ python tools/validate_reorient.py real <segdir> ...
 
 | File | Role |
 | --- | --- |
-| `orbslam3_orientation/io.py` | load ORB-SLAM3, IMU, calibration, time offset (local or S3, read-only) |
-| `orbslam3_orientation/geometry.py` | SO(3) helpers, gyro integration, yaw between rotations |
-| `orbslam3_orientation/core.py` | `Config` (all thresholds), per-map checks and re-levelling; `process` (stitch mode) |
-| `orbslam3_orientation/reorient.py` | **per-map re-orientation:** anchor, gyro bias, hand-offs, A.2 world |
-| `orbslam3_orientation/deliverable.py` | writes the ORB-SLAM3-shaped output and `orientation_report.json` |
-| `orbslam3_orientation/simulate.py` | reproduces the exporter's per-map levelling, for tests and validation tools |
-| `orbslam3_orientation/render.py` | check videos (`render_maps` for reorient) |
-| `orbslam3_orientation/__main__.py` | CLI (`reorient`, `process`) |
+| `src/io.py` | load ORB-SLAM3, IMU, calibration, time offset (local or S3, read-only) |
+| `src/geometry.py` | SO(3) helpers, gyro integration, yaw between rotations |
+| `src/core.py` | `Config` (all thresholds), per-map checks and re-levelling; `process` (stitch mode) |
+| `src/reorient.py` | **per-map re-orientation:** anchor, gyro bias, hand-offs, A.2 world |
+| `src/deliverable.py` | writes the ORB-SLAM3-shaped output and `orientation_report.json` |
+| `src/simulate.py` | reproduces the exporter's per-map levelling, for tests and validation tools |
+| `src/render.py` | check videos (`render_maps` for reorient) |
+| `src/__main__.py` | CLI (`reorient`, `process`) |
 | `tests/` | synthetic tests |
 | `tools/` | real-data validation |
 

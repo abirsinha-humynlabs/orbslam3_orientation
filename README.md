@@ -131,12 +131,12 @@ directly, gyro vs mod-slam across real breaks: under 1 s gaps ~0.15°; 1–10 s 
 pip install -r requirements.txt
 
 # local folders (ORB-SLAM3's segment folder + chunking inputs)
-python -m orbslam3_orientation reorient \
+python -m src reorient \
     --orbslam3 <orbslam3 seg dir> --inputs <chunking seg dir> --out <new folder> \
     [--render check.mp4 --video left_rectified.mp4]
 
 # straight from S3 (read-only: only downloads; output is local)
-python -m orbslam3_orientation reorient --bucket prod-egc-stereo-v2-data --profile prod \
+python -m src reorient --bucket prod-egc-stereo-v2-data --profile prod \
     --segment <dataset>/.../<chunk>/seg_NNN --out <new folder> [--render check.mp4]
 
 python tests/test_reorient.py
@@ -249,12 +249,12 @@ health check (median p99 speed 23.5 m/s). Those are dropped and listed.
 pip install -r requirements.txt
 
 # local folders
-python -m orbslam3_orientation process \
+python -m src process \
     --orbslam3 <orbslam3 seg dir> --inputs <chunking seg dir> [--mod-slam <mod-slam seg dir>] \
     --out out/<seg> [--render out/<seg>.mp4 --video <left_rectified.mp4>]
 
 # straight from S3 (read-only: only downloads)
-python -m orbslam3_orientation process --bucket prod-egc-stereo-v2-data --profile prod \
+python -m src process --bucket prod-egc-stereo-v2-data --profile prod \
     --segment bitrobot/<site>/<date>/<worker>/<session>/<chunk>/seg_NNN --out out/<seg> [--render out/<seg>.mp4]
 
 python tests/test_stitch.py

@@ -13,10 +13,10 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from orbslam3_orientation.core import Config, process            # noqa: E402
-from orbslam3_orientation.geometry import exp_so3, rot_z          # noqa: E402
-from orbslam3_orientation.io import Segment                       # noqa: E402
-from orbslam3_orientation.simulate import level_like_exporter      # noqa: E402
+from src.core import Config, process            # noqa: E402
+from src.geometry import exp_so3, rot_z          # noqa: E402
+from src.io import Segment                       # noqa: E402
+from src.simulate import level_like_exporter      # noqa: E402
 
 G = 9.80665
 

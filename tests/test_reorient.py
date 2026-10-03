@@ -19,10 +19,10 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 from test_stitch import make_segment                               # noqa: E402
-from orbslam3_orientation.core import Config                       # noqa: E402
-from orbslam3_orientation.deliverable import write                 # noqa: E402
-from orbslam3_orientation.io import load_local                     # noqa: E402
-from orbslam3_orientation.reorient import reorient                 # noqa: E402
+from src.core import Config                       # noqa: E402
+from src.deliverable import write                 # noqa: E402
+from src.io import load_local                     # noqa: E402
+from src.reorient import reorient                 # noqa: E402
 
 
 def _fake_orbslam3(seg, d):
@@ -103,8 +103,8 @@ def test_reorient_deliverable():
 
 def test_guards():
     """Reviewer findings E5-E8: each guard must fire on the failure it exists for."""
-    from orbslam3_orientation.geometry import exp_so3
-    from orbslam3_orientation.simulate import level_like_exporter
+    from src.geometry import exp_so3
+    from src.simulate import level_like_exporter
     cfg = Config(speed_p99_max=5.0)
     # E6: exporter switched to the RECTIFIED extrinsic -> identified exactly, not missed
     seg, _ = make_segment()

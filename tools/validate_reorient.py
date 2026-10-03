@@ -22,12 +22,12 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from orbslam3_orientation import load_local                 # noqa: E402
-from orbslam3_orientation.geometry import rot_z, yaw_between  # noqa: E402
+from src import load_local                 # noqa: E402
+from src.geometry import rot_z, yaw_between  # noqa: E402
 
 ZUP = np.array([[1.0, 0, 0], [0, 0, 1.0], [0, -1.0, 0]])
-from orbslam3_orientation.reorient import reorient          # noqa: E402
-from orbslam3_orientation.simulate import level_like_exporter  # noqa: E402
+from src.reorient import reorient          # noqa: E402
+from src.simulate import level_like_exporter  # noqa: E402
 
 
 def load(d, ref=False):
